@@ -73,7 +73,7 @@ private:
   // Software SPI transfer (bit-banging)
   static uint8_t spiTransfer(uint8_t data) {
     uint8_t rxData = 0;
-    
+
     for (int i = 7; i >= 0; i--) {
       // MOSI - set data bit
       if (data & (1 << i)) {
@@ -81,21 +81,24 @@ private:
       } else {
         digitalWrite(_diPin, LOW);
       }
-      
+
       // SCK rising edge
       digitalWrite(_clkPin, HIGH);
-      asm volatile("nop"); asm volatile("nop"); asm volatile("nop");
-      
+      asm volatile("nop");
+      asm volatile("nop");
+      asm volatile("nop");
+
       // MISO - read data bit
       if (digitalRead(_doPin)) {
         rxData |= (1 << i);
       }
-      
+
       // SCK falling edge
       digitalWrite(_clkPin, LOW);
-      asm volatile("nop"); asm volatile("nop");
+      asm volatile("nop");
+      asm volatile("nop");
     }
-    
+
     return rxData;
   }
 
@@ -134,7 +137,7 @@ private:
     select();
     spiTransfer(CMD_WRITE_ENABLE);
     deselect();
-    
+
     select();
     spiTransfer(CMD_READ_STATUS_REG1);
     uint8_t status = spiTransfer(0xFF);
@@ -168,9 +171,9 @@ public:
     if (_initialized) return true;
 
     _csPin = csPin;
-    _clkPin = FLASH_CLK_PIN;   // PB3
-    _doPin = FLASH_DO_PIN;     // PB4
-    _diPin = FLASH_DI_PIN;     // PB5
+    _clkPin = FLASH_CLK_PIN;  // PB3
+    _doPin = FLASH_DO_PIN;    // PB4
+    _diPin = FLASH_DI_PIN;    // PB5
 
     // Configure pins
     pinMode(_csPin, OUTPUT);
@@ -266,9 +269,7 @@ public:
     cfg.crc32 = calculateCRC32((const uint8_t*)&cfg, sizeof(FlashConfig) - 4);
 
     FlashConfig stored;
-    if (readBytes(FLASH_CONFIG_ADDR, (uint8_t*)&stored, sizeof(FlashConfig)) &&
-        stored.magic == FLASH_MAGIC_NUMBER &&
-        memcmp(&cfg, &stored, sizeof(FlashConfig) - 4) == 0) {
+    if (readBytes(FLASH_CONFIG_ADDR, (uint8_t*)&stored, sizeof(FlashConfig)) && stored.magic == FLASH_MAGIC_NUMBER && memcmp(&cfg, &stored, sizeof(FlashConfig) - 4) == 0) {
       return true;
     }
 
@@ -277,8 +278,7 @@ public:
     for (int retry = 0; retry < FLASH_RETRY_COUNT; retry++) {
       if (writeBytes(FLASH_CONFIG_ADDR, (const uint8_t*)&cfg, sizeof(FlashConfig))) {
         FlashConfig verify;
-        if (readBytes(FLASH_CONFIG_ADDR, (uint8_t*)&verify, sizeof(FlashConfig)) &&
-            memcmp(&cfg, &verify, sizeof(FlashConfig)) == 0) {
+        if (readBytes(FLASH_CONFIG_ADDR, (uint8_t*)&verify, sizeof(FlashConfig)) && memcmp(&cfg, &verify, sizeof(FlashConfig)) == 0) {
           return true;
         }
       }
@@ -290,13 +290,13 @@ public:
   static bool loadConfig(FlashConfig& config) {
     if (!readBytes(FLASH_CONFIG_ADDR, (uint8_t*)&config, sizeof(FlashConfig))) return false;
     if (config.magic != FLASH_MAGIC_NUMBER) return false;
-    
+
     if (config.version == 1) {
       config.pidFlags = 0;
     } else if (config.version > FLASH_VERSION) {
       return false;
     }
-    
+
     uint32_t storedCrc = config.crc32;
     config.crc32 = 0;
     uint32_t calcCrc = calculateCRC32((const uint8_t*)&config, sizeof(FlashConfig) - 4);
@@ -333,8 +333,12 @@ public:
     _initialized = false;
   }
 
-  static bool isInitialized() { return _initialized; }
-  static uint8_t getCSPin() { return _csPin; }
+  static bool isInitialized() {
+    return _initialized;
+  }
+  static uint8_t getCSPin() {
+    return _csPin;
+  }
 };
 
 // ============================================================================

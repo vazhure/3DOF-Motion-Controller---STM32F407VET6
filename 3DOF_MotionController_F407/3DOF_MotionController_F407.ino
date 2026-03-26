@@ -1,10 +1,17 @@
 // 3DOF Motion Controller - STM32F407VET6
-// V1.3 - SPI Flash storage integrated
+// V1.4 - Fast GPIO for stepper control
+//
+// V1.4 Changes:
+// 1. Fast GPIO macros for stepper pins (10-20x faster than digitalWrite)
+// 2. Direct BSRR register access in ISR for minimum jitter
+// 3. Separate FastGPIO.h file for reusable fast GPIO functions
 //
 // V1.3 Changes:
-// 1. Reassign LIMIT PINS to PD0,PD1,PD4,PD5 due Timer3 / SPI 2 conflict
+// 1. Reassign LIMIT PINS to PD0,PD1,PD4,PD5 due Timer3 / SPI2 conflict
+//
 // V1.2 Changes:
 // 1. SPI Flash storage fix. No hardware SPI conflict with Timer2/Timer3
+//
 // V1.1 Changes:
 // 1. SPI Flash storage for persistent settings (Winbond W25Q16)
 // 2. PID controller with anti-windup
@@ -18,7 +25,7 @@
 // Optimize: Fast (-O1)
 //
 // Email: v.azhure@gmail.com
-// Modified: 2025-03-25
+// Modified: 2025-03-26
 
 //#define DEBUG
 
@@ -26,6 +33,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include "FastGPIO.h"
 #include "SpiFlashStorage.h"
 
 // ============================================================================
@@ -221,12 +229,23 @@ struct PIDController {
 };
 
 // ============================================================================
-// AXIS DATA STRUCTURE
+// AXIS DATA STRUCTURE (with Fast GPIO fields)
 // ============================================================================
 struct AxisData {
+  // Standard pin definitions
   uint32_t stepPin;
   uint32_t dirPin;
   uint32_t limitPin;
+
+  // Fast GPIO fields (pre-calculated for ISR speed)
+  GPIO_Regs* stepPort;  // Pointer to GPIO port register struct
+  uint8_t stepPinBit;   // Pin bit number (0-15)
+  GPIO_Regs* dirPort;
+  uint8_t dirPinBit;
+  GPIO_Regs* limitPort;
+  uint8_t limitPinBit;
+
+  // State
   STATE state;
   volatile int32_t currentPos;
   volatile int32_t targetPos;
@@ -271,6 +290,9 @@ uint32_t lastStatsMs = 0;
 uint32_t loopCount = 0;
 static bool configLoaded = false;
 static bool configDirty = false;
+
+// Pre-calculated LED state for fast toggle
+static volatile uint8_t ledOdrMask = 0;  // Shadow register for LED state
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -360,7 +382,7 @@ static inline float computePID(AxisData* axis, uint32_t currentTime) {
 }
 
 // ============================================================================
-// TIMER ISR - Parallel execution for all axes
+// TIMER ISR - Parallel execution for all axes (with Fast GPIO)
 // ============================================================================
 static inline bool checkHomingTarget(AxisData* axis) {
   if (!axis->isHoming) return false;
@@ -371,11 +393,12 @@ static inline bool checkHomingTarget(AxisData* axis) {
   }
 }
 
+// Main ISR - uses Fast GPIO for minimum jitter
 static inline void processTimerISR(AxisData* axis) {
   axis->isrCount++;
 
   if (!axis->steppingEnabled) {
-    digitalWrite(axis->stepPin, LOW);
+    PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO
     return;
   }
 
@@ -383,13 +406,13 @@ static inline void processTimerISR(AxisData* axis) {
   if (axis->isHoming) {
     if (checkHomingTarget(axis)) {
       axis->steppingEnabled = false;
-      digitalWrite(axis->stepPin, LOW);
+      PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO
       return;
     }
   } else {
     if (axis->currentPos == axis->targetPos) {
       axis->steppingEnabled = false;
-      digitalWrite(axis->stepPin, LOW);
+      PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO
       return;
     }
   }
@@ -397,16 +420,17 @@ static inline void processTimerISR(AxisData* axis) {
   // Check limit switch - stop if moving towards it
   if (axis->limitSwitchState == HIGH && axis->currentDir == HOME_DIRECTION) {
     axis->steppingEnabled = false;
-    digitalWrite(axis->stepPin, LOW);
+    PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO
     return;
   }
 
   // Generate STEP pulse (toggle on each ISR call)
+  // Using Fast GPIO macros for maximum speed
   if (!axis->stepPinState) {
-    digitalWrite(axis->stepPin, HIGH);
+    PIN_SET(axis->stepPort, axis->stepPinBit);  // Fast GPIO - set HIGH
     axis->stepPinState = true;
   } else {
-    digitalWrite(axis->stepPin, LOW);
+    PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO - set LOW
     axis->stepPinState = false;
     axis->currentPos += (axis->currentDir == HIGH) ? 1 : -1;
     axis->stepCount++;
@@ -427,7 +451,7 @@ void timerISR_3() {
 }
 
 // ============================================================================
-// STEPPING CONTROL
+// STEPPING CONTROL (with Fast GPIO)
 // ============================================================================
 void initStepTimer(int axisIndex) {
   if (Timers[axisIndex] == nullptr) return;
@@ -470,12 +494,19 @@ static inline void setStepFrequency(int axisIndex, uint32_t freqHz) {
 
 static inline void startStepping(AxisData* axis, uint8_t dir) {
   axis->steppingEnabled = false;
-  digitalWrite(axis->stepPin, LOW);
+  PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO
   axis->stepPinState = false;
 
   if (axis->currentDir != dir) {
     delayMicroseconds(MIN_REVERSE_DELAY);
-    digitalWrite(axis->dirPin, dir);
+
+    // Fast GPIO for direction pin
+    if (dir == HIGH) {
+      PIN_SET(axis->dirPort, axis->dirPinBit);
+    } else {
+      PIN_CLR(axis->dirPort, axis->dirPinBit);
+    }
+
     axis->currentDir = dir;
     delayMicroseconds(MIN_REVERSE_DELAY);
   }
@@ -486,24 +517,35 @@ static inline void startStepping(AxisData* axis, uint8_t dir) {
 
 static inline void stopStepping(AxisData* axis) {
   axis->steppingEnabled = false;
-  digitalWrite(axis->stepPin, LOW);
+  PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO
   axis->stepPinState = false;
 }
 
 static inline void updateLimitSwitch(AxisData* axis) {
-  axis->limitSwitchState = digitalRead(axis->limitPin);
+  // Fast GPIO read for limit switch
+  axis->limitSwitchState = PIN_READ(axis->limitPort, axis->limitPinBit);
 }
 
 // ============================================================================
-// AXIS INITIALIZATION
+// AXIS INITIALIZATION (with Fast GPIO setup)
 // ============================================================================
 void initAxis(int index, uint32_t stepPin, uint32_t dirPin, uint32_t limitPin) {
   AxisData* axis = &axes[index];
 
+  // Store standard pin numbers
   axis->stepPin = stepPin;
   axis->dirPin = dirPin;
   axis->limitPin = limitPin;
 
+  // Calculate Fast GPIO port and bit (pre-calc for ISR speed)
+  axis->stepPort = getGpioPort(stepPin);
+  axis->stepPinBit = getGpioPinBit(stepPin);
+  axis->dirPort = getGpioPort(dirPin);
+  axis->dirPinBit = getGpioPinBit(dirPin);
+  axis->limitPort = getGpioPort(limitPin);
+  axis->limitPinBit = getGpioPinBit(limitPin);
+
+  // Configure pins (still use standard functions for setup)
   pinMode(stepPin, OUTPUT);
   pinMode(dirPin, OUTPUT);
   pinMode(limitPin, INPUT_PULLDOWN);
@@ -511,6 +553,7 @@ void initAxis(int index, uint32_t stepPin, uint32_t dirPin, uint32_t limitPin) {
   digitalWrite(stepPin, LOW);
   digitalWrite(dirPin, LOW);
 
+  // Initialize state
   axis->state.mode = (uint8_t)MODE::CONNECTED;
   axis->state.flags = 0;
   axis->state.speedMMperSEC = (uint16_t)DEFAULT_SPEED_MM_SEC;
@@ -522,7 +565,7 @@ void initAxis(int index, uint32_t stepPin, uint32_t dirPin, uint32_t limitPin) {
   axis->homeTargetPos = 0;
   axis->currentDir = LOW;
   axis->bHomed = false;
-  axis->limitSwitchState = digitalRead(limitPin);
+  axis->limitSwitchState = PIN_READ(axis->limitPort, axis->limitPinBit);  // Fast GPIO read
   axis->steppingEnabled = false;
   axis->stepPinState = false;
   axis->isrCount = 0;
@@ -689,13 +732,13 @@ static inline void processReadyMotion(AxisData* axis, int axisIndex) {
 }
 
 // ============================================================================
-// SERIAL COMMUNICATION
+// SERIAL COMMUNICATION (with Fast GPIO for LED)
 // ============================================================================
 void readSerialData() {
   int avail = SerialMy.available();
   if (avail == 0) return;
 
-  digitalWrite(SERIAL_LED_PIN, LOW);
+  PIN_CLR(SERIAL_LED_PORT, SERIAL_LED_BIT);  // Fast GPIO - LED ON
 
   while (avail-- > 0) {
     int byte = SerialMy.read();
@@ -715,7 +758,7 @@ void readSerialData() {
     }
   }
 
-  digitalWrite(SERIAL_LED_PIN, HIGH);
+  PIN_SET(SERIAL_LED_PORT, SERIAL_LED_BIT);  // Fast GPIO - LED OFF
 }
 
 // ============================================================================
@@ -928,7 +971,7 @@ void ProcessCommand() {
         flashConfig.pidKd = axes[0].pid.Kd;
         flashConfig.pidKs = axes[0].pid.Ks;
         flashConfig.pidBlend = (uint16_t)(axes[0].pidBlend * 100.0f);
-        flashConfig.pidFlags = (uint16_t)pid_state.flags;  // Save PID flags!
+        flashConfig.pidFlags = (uint16_t)pid_state.flags;
         flashConfig.defaultSpeed = axes[0].state.speedMMperSEC;
         flashConfig.acceleration = (uint32_t)(axes[0].maxAccelSteps * MM_PER_REV / STEPS_PER_REVOLUTIONS);
         if (SpiFlashStorage::saveConfig(flashConfig)) {
@@ -949,14 +992,14 @@ void ProcessCommand() {
           axes[i].pid.Kd = flashConfig.pidKd;
           axes[i].pid.Ks = flashConfig.pidKs;
           axes[i].pidBlend = flashConfig.pidBlend / 100.0f;
-          axes[i].pidControlEnabled = (flashConfig.pidFlags & PID_ENABLED) != 0;  // Restore!
+          axes[i].pidControlEnabled = (flashConfig.pidFlags & PID_ENABLED) != 0;
         }
         pid_state.masterPidKp = flashConfig.pidKp;
         pid_state.masterPidKi = flashConfig.pidKi;
         pid_state.masterPidKd = flashConfig.pidKd;
         pid_state.masterPidKs = flashConfig.pidKs;
         pid_state.masterPidBlend = flashConfig.pidBlend;
-        pid_state.flags = (uint8_t)flashConfig.pidFlags;  // Restore flags!
+        pid_state.flags = (uint8_t)flashConfig.pidFlags;
         configDirty = false;
       }
       break;
@@ -967,7 +1010,7 @@ void ProcessCommand() {
 }
 
 // ============================================================================
-// LED STATUS INDICATOR
+// LED STATUS INDICATOR (with Fast GPIO)
 // ============================================================================
 void updateLedStatus() {
   static uint32_t lastToggle = 0;
@@ -987,14 +1030,19 @@ void updateLedStatus() {
   if (estopLatched) blinkPeriod = 100;
   else if (anyHoming) blinkPeriod = 500;
   else if (allReady) {
-    digitalWrite(LED_PIN, LOW);
+    PIN_CLR(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED ON (steady)
     return;
   } else blinkPeriod = 1000;
 
   if (now - lastToggle >= blinkPeriod) {
     lastToggle = now;
     ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? LOW : HIGH);
+
+    if (ledState) {
+      PIN_CLR(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED ON
+    } else {
+      PIN_SET(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED OFF
+    }
   }
 }
 
@@ -1075,21 +1123,25 @@ void printDebugStatus() {
 // SETUP
 // ============================================================================
 void setup() {
+  // Initialize LED pins (Fast GPIO compatible)
   pinMode(LED_PIN, OUTPUT);
   pinMode(SERIAL_LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
-  digitalWrite(SERIAL_LED_PIN, HIGH);
+  pinMode(ALARM_PIN, INPUT_PULLDOWN);
 
-  // Startup blink
+  // Initial state - LEDs OFF
+  PIN_SET(LED_PORT, LED_PIN_BIT);            // Fast GPIO - LED OFF
+  PIN_SET(SERIAL_LED_PORT, SERIAL_LED_BIT);  // Fast GPIO - LED OFF
+
+  // Startup blink (5 fast blinks)
   for (int i = 0; i < 5; i++) {
-    digitalWrite(LED_PIN, LOW);
+    PIN_CLR(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED ON
     delay(50);
-    digitalWrite(LED_PIN, HIGH);
+    PIN_SET(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED OFF
     delay(50);
   }
 
-  pinMode(ALARM_PIN, INPUT_PULLDOWN);
-  estopLatched = (digitalRead(ALARM_PIN) == HIGH);
+  // Check ALARM pin (E-STOP)
+  estopLatched = (PIN_READ(ALARM_PORT, ALARM_PIN_BIT) == 1);  // Fast GPIO read
 
   // Initialize PID state defaults
   pid_state.version = 1;
@@ -1121,7 +1173,7 @@ void setup() {
                                      (int)MMPERSEC2DELAY(flashConfig.defaultSpeed) - MIN_PULSE_DELAY);
         axes[i].pid.maxFreq = (float)mmPerSecToFreq(flashConfig.defaultSpeed);
         axes[i].maxAccelSteps = (int32_t)((float)flashConfig.acceleration * STEPS_PER_REVOLUTIONS / MM_PER_REV);
-        axes[i].pidControlEnabled = (flashConfig.pidFlags & PID_ENABLED) != 0;  // FIXED!
+        axes[i].pidControlEnabled = (flashConfig.pidFlags & PID_ENABLED) != 0;
       }
       // Sync pid_state for Plugin.cs
       pid_state.masterPidKp = flashConfig.pidKp;
@@ -1129,7 +1181,7 @@ void setup() {
       pid_state.masterPidKd = flashConfig.pidKd;
       pid_state.masterPidKs = flashConfig.pidKs;
       pid_state.masterPidBlend = flashConfig.pidBlend;
-      pid_state.flags = (uint8_t)flashConfig.pidFlags;  // FIXED!
+      pid_state.flags = (uint8_t)flashConfig.pidFlags;
       configLoaded = true;
 #ifdef DEBUG
       SerialMy.println("Flash: Config loaded");
@@ -1149,19 +1201,18 @@ void setup() {
 #endif
     }
   }
-  // ==============================
 
-  // Initialize axes
+  // Initialize axes (with Fast GPIO setup)
   initAxis(0, STEP_PIN_0, DIR_PIN_0, LIMIT_PIN_0);
   initAxis(1, STEP_PIN_1, DIR_PIN_1, LIMIT_PIN_1);
   initAxis(2, STEP_PIN_2, DIR_PIN_2, LIMIT_PIN_2);
   initAxis(3, STEP_PIN_3, DIR_PIN_3, LIMIT_PIN_3);
 
-  // Ready blink
+  // Ready blink (3 slow blinks)
   for (int i = 0; i < 3; i++) {
-    digitalWrite(LED_PIN, LOW);
+    PIN_CLR(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED ON
     delay(200);
-    digitalWrite(LED_PIN, HIGH);
+    PIN_SET(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED OFF
     delay(200);
   }
 }
@@ -1172,8 +1223,8 @@ void setup() {
 void loop() {
   loopCount++;
 
-  // E-STOP check
-  if (digitalRead(ALARM_PIN) == HIGH && !estopLatched) {
+  // E-STOP check (with Fast GPIO)
+  if (PIN_READ(ALARM_PORT, ALARM_PIN_BIT) && !estopLatched) {
     estopLatched = true;
     for (int i = 0; i < NUM_AXES; i++) {
       axes[i].state.mode = (uint8_t)MODE::ALARM;
@@ -1204,6 +1255,7 @@ void loop() {
       flashConfig.pidKd = axes[0].pid.Kd;
       flashConfig.pidKs = axes[0].pid.Ks;
       flashConfig.pidBlend = (uint16_t)(axes[0].pidBlend * 100.0f);
+      flashConfig.pidFlags = (uint16_t)pid_state.flags;
       flashConfig.defaultSpeed = axes[0].state.speedMMperSEC;
       flashConfig.acceleration = (uint32_t)(axes[0].maxAccelSteps * MM_PER_REV / STEPS_PER_REVOLUTIONS);
       if (SpiFlashStorage::saveConfig(flashConfig)) {
