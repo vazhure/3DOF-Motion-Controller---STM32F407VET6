@@ -1,6 +1,8 @@
 // 3DOF Motion Controller - STM32F407VET6
-// V1.2 - SPI Flash storage integrated
+// V1.3 - SPI Flash storage integrated
 //
+// V1.3 Changes:
+// 1. Reassign LIMIT PINS to PD0,PD1,PD4,PD5 due Timer3 / SPI 2 conflict
 // V1.2 Changes:
 // 1. SPI Flash storage fix. No hardware SPI conflict with Timer2/Timer3
 // V1.1 Changes:
@@ -154,12 +156,12 @@ const int PID_STATE_ID = 255;
 // Axis 2 - Rear Right
 #define STEP_PIN_2 PE12
 #define DIR_PIN_2 PE13
-#define LIMIT_PIN_2 PD2
+#define LIMIT_PIN_2 PD4
 
 // Axis 3 - Front Right
 #define STEP_PIN_3 PE14
 #define DIR_PIN_3 PE15
-#define LIMIT_PIN_3 PD3
+#define LIMIT_PIN_3 PD5
 
 // ============================================================================
 // BALLSCREW CONFIGURATION
