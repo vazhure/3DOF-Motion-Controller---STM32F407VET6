@@ -840,13 +840,17 @@ void ProcessCommand() {
         }
       }
       break;
-
     case COMMAND::CMD_DISABLE:
       for (int i = 0; i < NUM_AXES; i++) {
         if (pccmd.data[i] == 1) {
           axes[i].state.mode = (uint8_t)MODE::DISABLED;
           axes[i].isHoming = false;
+          axes[i].homeSubState = HOME_IDLE; // ИСПРАВЛЕНИЕ: Сброс состояния калибровки
           stopStepping(&axes[i]);
+          
+          // ВАЖНО: Фиксируем текущую позицию, чтобы при включении не было рывка
+          axes[i].targetPos = axes[i].currentPos; 
+          resetPID(&axes[i]);
         }
       }
       break;
@@ -858,6 +862,7 @@ void ProcessCommand() {
           axes[i].state.mode = (uint8_t)MODE::ALARM;
           axes[i].state.flags &= ~2;
           axes[i].isHoming = false;
+          axes[i].homeSubState = HOME_IDLE; // ИСПРАВЛЕНИЕ: Сброс состояния калибровки
           stopStepping(&axes[i]);
         }
       }
@@ -867,6 +872,12 @@ void ProcessCommand() {
       if (digitalRead(ALARM_PIN) != HIGH) {
         for (int i = 0; i < NUM_AXES; i++) {
           if (pccmd.data[i] == 1) {
+            // ИСПРАВЛЕНИЕ: Останавливаем любые движения и калибровку
+            axes[i].isHoming = false;
+            axes[i].homeSubState = HOME_IDLE; 
+            stopStepping(&axes[i]);
+            
+            // Переключаем в режим согласно статусу
             axes[i].state.mode = axes[i].bHomed ? (uint8_t)MODE::READY : (uint8_t)MODE::CONNECTED;
           }
         }
