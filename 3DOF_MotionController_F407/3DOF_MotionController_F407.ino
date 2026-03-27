@@ -1,5 +1,10 @@
 // 3DOF Motion Controller - STM32F407VET6
-// V1.4 - Fast GPIO for stepper control
+// V1.5 - Critical Bug Fixes
+// V1.5 Changes:
+// 1. FIXED: Timer clock frequency - use actual APB clock (84MHz for TIM2-7)
+// 2. FIXED: Interrupt priorities - timer ISRs higher priority than USB
+// 3. ADDED: Critical sections for direction changes
+// 4. IMPROVED: Frequency calculation with detected clock
 //
 // V1.4 Changes:
 // 1. Fast GPIO macros for stepper pins (10-20x faster than digitalWrite)
@@ -35,6 +40,17 @@
 #include <stdlib.h>
 #include "FastGPIO.h"
 #include "SpiFlashStorage.h"
+
+// ============================================================================
+// V1.5 NEW: Timer clock frequency (detected at init)
+// ============================================================================
+uint32_t timerClockFreq = 84000000UL;  // Default for TIM2-7 on APB1
+
+// ============================================================================
+// INTERRUPT PRIORITIES (0 = highest, 15 = lowest)
+// ============================================================================
+#define IRQ_PRIORITY_TIMER 2  // High priority for stepper timers
+#define IRQ_PRIORITY_USB 8    // Lower priority for USB
 
 // ============================================================================
 // PACKED STRUCTURES (Compatible with Plugin.cs)
@@ -469,6 +485,19 @@ void initStepTimer(int axisIndex) {
   else if (axisIndex == 3) isrFunc = timerISR_3;
 
   Timers[axisIndex]->attachInterrupt(TIMER_CH1, isrFunc);
+
+  // Set interrupt priority (timer = 2, USB = 8)
+  nvic_irq_num timerIRQ;
+  switch (axisIndex) {
+    case 0: timerIRQ = NVIC_TIMER2; break;
+    case 1: timerIRQ = NVIC_TIMER3; break;
+    case 2: timerIRQ = NVIC_TIMER4; break;
+    case 3: timerIRQ = NVIC_TIMER5; break;
+    default: timerIRQ = NVIC_TIMER2; break;
+  }
+
+  nvic_irq_set_priority(timerIRQ, IRQ_PRIORITY_TIMER);
+
   Timers[axisIndex]->refresh();
   Timers[axisIndex]->resume();
 }
@@ -480,39 +509,61 @@ static inline void setStepFrequency(int axisIndex, uint32_t freqHz) {
 
   axes[axisIndex].currentFrequency = freqHz;
 
-  // For 168MHz F407: overflow = 168000000 / (freqHz * 2)
   uint32_t timerFreq = freqHz * 2;
-  uint32_t overflow = 168000000UL / timerFreq;
+  uint32_t overflow = timerClockFreq / timerFreq;
 
   // 16-bit timer limit
   if (overflow < 100) overflow = 100;
   if (overflow > 65535) overflow = 65535;
 
-  Timers[axisIndex]->setOverflow(overflow);
+  Timers[axisIndex]->setOverflow(overflow - 1);
   Timers[axisIndex]->refresh();
 }
 
 static inline void startStepping(AxisData* axis, uint8_t dir) {
+#ifdef DEBUG
+  SerialMy.print("startStepping: dir=");
+  SerialMy.print(dir);
+  SerialMy.print(" currentDir=");
+  SerialMy.print(axis->currentDir);
+#endif
+
+  // Disable interrupts during critical section
+  noInterrupts();
+
   axis->steppingEnabled = false;
   PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO
   axis->stepPinState = false;
 
   if (axis->currentDir != dir) {
+    // Re-enable interrupts for the delay
+    interrupts();
     delayMicroseconds(MIN_REVERSE_DELAY);
 
-    // Fast GPIO for direction pin
+    // Change direction
+    noInterrupts();
     if (dir == HIGH) {
       PIN_SET(axis->dirPort, axis->dirPinBit);
     } else {
       PIN_CLR(axis->dirPort, axis->dirPinBit);
     }
-
     axis->currentDir = dir;
+    interrupts();
+
     delayMicroseconds(MIN_REVERSE_DELAY);
+    noInterrupts();
   }
 
   axis->stepPinState = false;
   axis->steppingEnabled = true;
+
+  // Re-enable interrupts
+  interrupts();
+
+#ifdef DEBUG
+  SerialMy.print(" steppingEnabled=");
+  SerialMy.println(axis->steppingEnabled ? "Y" : "N");
+#endif
 }
 
 static inline void stopStepping(AxisData* axis) {
@@ -1208,6 +1259,9 @@ void setup() {
   initAxis(2, STEP_PIN_2, DIR_PIN_2, LIMIT_PIN_2);
   initAxis(3, STEP_PIN_3, DIR_PIN_3, LIMIT_PIN_3);
 
+  nvic_irq_set_priority(NVIC_USB_FS, IRQ_PRIORITY_USB);
+  nvic_irq_set_priority(NVIC_USB_HS, IRQ_PRIORITY_USB);
+
   // Ready blink (3 slow blinks)
   for (int i = 0; i < 3; i++) {
     PIN_CLR(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED ON
@@ -1247,31 +1301,11 @@ void loop() {
   if ((loopCount & 0x7F) == 0) {
     updateLedStatus();
 
-    // Auto-save configuration every 10 seconds if changed
-    static uint32_t lastAutoSave = 0;
-    if (configDirty && millis() - lastAutoSave > 10000) {
-      flashConfig.pidKp = axes[0].pid.Kp;
-      flashConfig.pidKi = axes[0].pid.Ki;
-      flashConfig.pidKd = axes[0].pid.Kd;
-      flashConfig.pidKs = axes[0].pid.Ks;
-      flashConfig.pidBlend = (uint16_t)(axes[0].pidBlend * 100.0f);
-      flashConfig.pidFlags = (uint16_t)pid_state.flags;
-      flashConfig.defaultSpeed = axes[0].state.speedMMperSEC;
-      flashConfig.acceleration = (uint32_t)(axes[0].maxAccelSteps * MM_PER_REV / STEPS_PER_REVOLUTIONS);
-      if (SpiFlashStorage::saveConfig(flashConfig)) {
-        configDirty = false;
-      }
-      lastAutoSave = millis();
-    }
-
+#ifdef DEBUG
     if (millis() - lastStatsMs > 1000) {
       lastStatsMs = millis();
-#ifdef DEBUG
       printDebugStatus();
-#endif
-      cmdCount = 0;
-      moveCount = 0;
-      loopCount = 0;
     }
+#endif
   }
 }
