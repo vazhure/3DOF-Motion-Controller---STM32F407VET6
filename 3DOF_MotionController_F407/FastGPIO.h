@@ -81,6 +81,40 @@ typedef struct {
 #define ALARM_PORT GPIOA_REGS
 #define ALARM_PIN_BIT 0
 
+
+// ============================================================================
+// STM32F4 TIMER REGISTER STRUCTURE
+// ============================================================================
+typedef struct {
+  volatile uint32_t CR1;    // 0x00 - Control register 1
+  volatile uint32_t CR2;    // 0x04 - Control register 2
+  uint32_t RESERVED0;       // 0x08
+  volatile uint32_t DIER;   // 0x0C - DMA/Interrupt enable register
+  volatile uint32_t SR;     // 0x10 - Status register
+  volatile uint32_t EGR;    // 0x14 - Event generation register
+  volatile uint32_t CCMR1;  // 0x18 - Capture/compare mode register 1
+  volatile uint32_t CCMR2;  // 0x1C - Capture/compare mode register 2
+  volatile uint32_t CCER;   // 0x20 - Capture/compare enable register
+  volatile uint32_t CNT;    // 0x24 - Counter value
+  volatile uint32_t PSC;    // 0x28 - Prescaler
+  volatile uint32_t ARR;    // 0x2C - Auto-reload register (то, что нам нужно)
+  // Остальные регистры нам не нужны для управления скоростью
+} TIMER_Regs;
+
+// Базовые адреса таймеров для STM32F407
+#define TIM2_BASE_ADDR 0x40000000
+#define TIM3_BASE_ADDR 0x40000400
+#define TIM4_BASE_ADDR 0x40000800
+#define TIM5_BASE_ADDR 0x40000C00
+
+#define TIM_CR1_ARPE (1 << 7)
+
+// Указатели на таймеры
+#define TIM2_REGS ((TIMER_Regs*)TIM2_BASE_ADDR)
+#define TIM3_REGS ((TIMER_Regs*)TIM3_BASE_ADDR)
+#define TIM4_REGS ((TIMER_Regs*)TIM4_BASE_ADDR)
+#define TIM5_REGS ((TIMER_Regs*)TIM5_BASE_ADDR)
+
 // ============================================================================
 // HELPER FUNCTIONS - Convert Arduino pin to GPIO port and bit
 // ============================================================================

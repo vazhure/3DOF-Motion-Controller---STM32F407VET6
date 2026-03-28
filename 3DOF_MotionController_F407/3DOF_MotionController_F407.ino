@@ -300,6 +300,7 @@ uint8_t buf[32];
 int offset = 0;
 volatile bool _bDataPresent = false;
 HardwareTimer* Timers[NUM_AXES] = { &Timer2, &Timer3, &Timer4, &Timer5 };
+TIMER_Regs* TimerRegs[NUM_AXES] = { TIM2_REGS, TIM3_REGS, TIM4_REGS, TIM5_REGS };
 volatile uint32_t cmdCount = 0;
 volatile uint32_t moveCount = 0;
 uint32_t lastStatsMs = 0;
@@ -501,35 +502,33 @@ void initStepTimer(int axisIndex) {
   }
   nvic_irq_set_priority(timerIRQ, IRQ_PRIORITY_TIMER);
 
+  TimerRegs[axisIndex]->CR1 &= ~TIM_CR1_ARPE; 
+  
   Timers[axisIndex]->refresh();
   Timers[axisIndex]->resume();
 }
 
 static inline void setStepFrequency(int axisIndex, uint32_t freqHz) {
-  // FIX: Clamp frequency to safe limits.
-  // With Prescaler 1 @ 84MHz:
-  // TIM3/TIM4 are 16-bit. Max overflow 65535.
-  // Min Timer Freq = 84MHz / 65535 = 1281 Hz.
-  // Min Step Freq = 1281 / 2 = ~640 Hz.
-  // Setting limit to 650 Hz for safety margin.
-  if (freqHz < 650) freqHz = 650;
+  if (freqHz < 1) freqHz = 1; 
   if (freqHz > 40000) freqHz = 40000;
 
   if (Timers[axisIndex] == nullptr) return;
-
+  
   axes[axisIndex].currentFrequency = freqHz;
 
   uint32_t timerFreq = freqHz * 2;
-
-  // Calculate overflow based on detected APB1 clock (84MHz)
   uint32_t overflow = timerClockFreq / timerFreq;
 
-  // FIX: ARR register must be (period - 1) because counter starts at 0
-  if (overflow < 100) overflow = 100;      // Limit max speed (safety)
-  if (overflow > 65535) overflow = 65535;  // Limit for 16-bit timers (TIM3/TIM4)
+  if (overflow < 100) overflow = 100;
+  if (overflow > 65535) overflow = 65535;
 
-  Timers[axisIndex]->setOverflow(overflow - 1);
-  Timers[axisIndex]->refresh();
+  uint32_t arrValue = overflow - 1;
+
+  TimerRegs[axisIndex]->ARR = arrValue;
+
+  if (TimerRegs[axisIndex]->CNT > arrValue) {
+      TimerRegs[axisIndex]->CNT = 0;
+  }  
 }
 
 static inline void startStepping(AxisData* axis, uint8_t dir) {
@@ -540,37 +539,26 @@ static inline void startStepping(AxisData* axis, uint8_t dir) {
   SerialMy.print(axis->currentDir);
 #endif
 
-  // Disable interrupts during critical section
-  noInterrupts();
-
   axis->steppingEnabled = false;
   PIN_CLR(axis->stepPort, axis->stepPinBit);  // Fast GPIO
   axis->stepPinState = false;
 
   if (axis->currentDir != dir) {
-    // Re-enable interrupts for the delay
-    interrupts();
     delayMicroseconds(MIN_REVERSE_DELAY);
 
     // Change direction
-    noInterrupts();
     if (dir == HIGH) {
       PIN_SET(axis->dirPort, axis->dirPinBit);
     } else {
       PIN_CLR(axis->dirPort, axis->dirPinBit);
     }
     axis->currentDir = dir;
-    interrupts();
 
     delayMicroseconds(MIN_REVERSE_DELAY);
-    noInterrupts();
   }
 
   axis->stepPinState = false;
   axis->steppingEnabled = true;
-
-  // Re-enable interrupts
-  interrupts();
 
 #ifdef DEBUG
   SerialMy.print(" steppingEnabled=");
@@ -616,34 +604,26 @@ void initAxis(int index, uint32_t stepPin, uint32_t dirPin, uint32_t limitPin) {
   digitalWrite(stepPin, LOW);
   digitalWrite(dirPin, LOW);
 
-  // Initialize state
+  // Initialize STATE struct
   axis->state.mode = (uint8_t)MODE::CONNECTED;
   axis->state.flags = 0;
-  axis->state.speedMMperSEC = (uint16_t)DEFAULT_SPEED_MM_SEC;
   axis->state.min = MIN_POS;
   axis->state.max = MAX_POS;
 
+  // Initialize motion variables (position, homing state)
   axis->currentPos = 0;
   axis->targetPos = (MIN_POS + MAX_POS) / 2;
   axis->homeTargetPos = 0;
   axis->currentDir = LOW;
   axis->bHomed = false;
-  axis->limitSwitchState = PIN_READ(axis->limitPort, axis->limitPinBit);  // Fast GPIO read
+  axis->limitSwitchState = PIN_READ(axis->limitPort, axis->limitPinBit);
   axis->steppingEnabled = false;
   axis->stepPinState = false;
   axis->isrCount = 0;
   axis->stepCount = 0;
   axis->currentFrequency = 0;
-
-  axis->fastPulseDelay = FAST_PULSE_DELAY;
-  axis->slowPulseDelay = SLOW_PULSE_DELAY;
-  axis->pid.maxFreq = (float)mmPerSecToFreq(MAX_SPEED_MM_SEC);
-  axis->pidControlEnabled = false;
-  axis->pidBlend = 1.0f;
-  axis->maxAccelSteps = (int32_t)(25000.0f * STEPS_PER_REVOLUTIONS / MM_PER_REV);
   axis->homeSubState = HOME_IDLE;
   axis->isHoming = false;
-
   resetPID(axis);
   initStepTimer(index);
 }
@@ -759,10 +739,9 @@ static inline void processReadyMotion(AxisData* axis, int axisIndex) {
     uint32_t desiredFreqHz = 0;
 
     if (axis->pidControlEnabled) {
-      // Use PID controller
       desiredFreqHz = (uint32_t)computePID(axis, millis());
     } else {
-      // Legacy motion profiling
+      // Legacy motion profiling...
       if (absError > STEPS_CONTROL_DIST) {
         desiredFreqHz = delayToFreq(axis->fastPulseDelay);
       } else if (absError > STEPS_CONTROL_DIST / 4) {
@@ -774,7 +753,7 @@ static inline void processReadyMotion(AxisData* axis, int axisIndex) {
 
     uint32_t freqHz = applyAccelLimit(axis, desiredFreqHz);
 
-    if (freqHz > 100) {
+    if (freqHz > 0) {
       setStepFrequency(axisIndex, freqHz);
       if (!axis->steppingEnabled) {
         if (axis->pidControlEnabled) resetPID(axis);
@@ -1284,14 +1263,6 @@ void setup() {
 
   nvic_irq_set_priority(NVIC_USB_FS, IRQ_PRIORITY_USB);
   nvic_irq_set_priority(NVIC_USB_HS, IRQ_PRIORITY_USB);
-
-  // Ready blink (3 slow blinks)
-  for (int i = 0; i < 3; i++) {
-    PIN_CLR(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED ON
-    delay(200);
-    PIN_SET(LED_PORT, LED_PIN_BIT);  // Fast GPIO - LED OFF
-    delay(200);
-  }
 }
 
 // ============================================================================
