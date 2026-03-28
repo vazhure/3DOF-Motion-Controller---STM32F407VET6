@@ -474,8 +474,12 @@ void initStepTimer(int axisIndex) {
 
   Timers[axisIndex]->init();
   Timers[axisIndex]->pause();
-  Timers[axisIndex]->setPrescaleFactor(1);   // 168MHz for F407
-  Timers[axisIndex]->setOverflow(4200 - 1);  // Initial ~1282Hz
+
+  // Prescaler 1 => Timer Clock runs at APB1 frequency = 84MHz
+  Timers[axisIndex]->setPrescaleFactor(1);
+
+  // Set safe default overflow (approx 650Hz step freq)
+  Timers[axisIndex]->setOverflow(65535);
 
   Timers[axisIndex]->setMode(TIMER_CH1, TIMER_OUTPUT_COMPARE);
 
@@ -486,7 +490,7 @@ void initStepTimer(int axisIndex) {
 
   Timers[axisIndex]->attachInterrupt(TIMER_CH1, isrFunc);
 
-  // Set interrupt priority (timer = 2, USB = 8)
+  // ... (IRQ Priority logic remains the same) ...
   nvic_irq_num timerIRQ;
   switch (axisIndex) {
     case 0: timerIRQ = NVIC_TIMER2; break;
@@ -495,7 +499,6 @@ void initStepTimer(int axisIndex) {
     case 3: timerIRQ = NVIC_TIMER5; break;
     default: timerIRQ = NVIC_TIMER2; break;
   }
-
   nvic_irq_set_priority(timerIRQ, IRQ_PRIORITY_TIMER);
 
   Timers[axisIndex]->refresh();
@@ -503,18 +506,27 @@ void initStepTimer(int axisIndex) {
 }
 
 static inline void setStepFrequency(int axisIndex, uint32_t freqHz) {
-  if (freqHz < 100) freqHz = 100;
+  // FIX: Clamp frequency to safe limits.
+  // With Prescaler 1 @ 84MHz:
+  // TIM3/TIM4 are 16-bit. Max overflow 65535.
+  // Min Timer Freq = 84MHz / 65535 = 1281 Hz.
+  // Min Step Freq = 1281 / 2 = ~640 Hz.
+  // Setting limit to 650 Hz for safety margin.
+  if (freqHz < 650) freqHz = 650;
   if (freqHz > 40000) freqHz = 40000;
+
   if (Timers[axisIndex] == nullptr) return;
 
   axes[axisIndex].currentFrequency = freqHz;
 
   uint32_t timerFreq = freqHz * 2;
+
+  // Calculate overflow based on detected APB1 clock (84MHz)
   uint32_t overflow = timerClockFreq / timerFreq;
 
-  // 16-bit timer limit
-  if (overflow < 100) overflow = 100;
-  if (overflow > 65535) overflow = 65535;
+  // FIX: ARR register must be (period - 1) because counter starts at 0
+  if (overflow < 100) overflow = 100;      // Limit max speed (safety)
+  if (overflow > 65535) overflow = 65535;  // Limit for 16-bit timers (TIM3/TIM4)
 
   Timers[axisIndex]->setOverflow(overflow - 1);
   Timers[axisIndex]->refresh();
@@ -845,11 +857,11 @@ void ProcessCommand() {
         if (pccmd.data[i] == 1) {
           axes[i].state.mode = (uint8_t)MODE::DISABLED;
           axes[i].isHoming = false;
-          axes[i].homeSubState = HOME_IDLE; // ИСПРАВЛЕНИЕ: Сброс состояния калибровки
+          axes[i].homeSubState = HOME_IDLE;  // ИСПРАВЛЕНИЕ: Сброс состояния калибровки
           stopStepping(&axes[i]);
-          
+
           // ВАЖНО: Фиксируем текущую позицию, чтобы при включении не было рывка
-          axes[i].targetPos = axes[i].currentPos; 
+          axes[i].targetPos = axes[i].currentPos;
           resetPID(&axes[i]);
         }
       }
@@ -862,7 +874,7 @@ void ProcessCommand() {
           axes[i].state.mode = (uint8_t)MODE::ALARM;
           axes[i].state.flags &= ~2;
           axes[i].isHoming = false;
-          axes[i].homeSubState = HOME_IDLE; // ИСПРАВЛЕНИЕ: Сброс состояния калибровки
+          axes[i].homeSubState = HOME_IDLE;  // ИСПРАВЛЕНИЕ: Сброс состояния калибровки
           stopStepping(&axes[i]);
         }
       }
@@ -874,9 +886,9 @@ void ProcessCommand() {
           if (pccmd.data[i] == 1) {
             // ИСПРАВЛЕНИЕ: Останавливаем любые движения и калибровку
             axes[i].isHoming = false;
-            axes[i].homeSubState = HOME_IDLE; 
+            axes[i].homeSubState = HOME_IDLE;
             stopStepping(&axes[i]);
-            
+
             // Переключаем в режим согласно статусу
             axes[i].state.mode = axes[i].bHomed ? (uint8_t)MODE::READY : (uint8_t)MODE::CONNECTED;
           }
